@@ -89,9 +89,13 @@ function prompt(question) {
   });
 }
 
-async function collectConfig() {
-  console.log('\n=== Web Farming Local Agent Setup ===\n');
-  const serverUrl = await prompt('Enter the hosted server URL: ');
+async function collectConfig(existingUrl) {
+  if (!existingUrl) {
+    console.log('\n=== Web Farming Local Agent Setup ===\n');
+  } else {
+    console.log('\n Re-authenticating...\n');
+  }
+  const serverUrl = existingUrl || await prompt('Enter the hosted server URL: ');
   const username = await prompt('Enter your username: ');
   const password = await prompt('Enter your password: ');
 
@@ -101,13 +105,13 @@ async function collectConfig() {
     const res = await axios.post(`${cleanUrl}/api/auth/login`, { username, password }, { timeout: 10000 });
     if (!res.data.success || !res.data.token) {
       console.log(' Login failed: ' + (res.data.message || 'Invalid credentials'));
-      process.exit(1);
+      return collectConfig(existingUrl);
     }
     console.log(` Logged in as ${res.data.username}\n`);
-    return { serverUrl: cleanUrl, token: res.data.token };
+    return { serverUrl: cleanUrl, token: res.data.token, username: res.data.username };
   } catch (err) {
     console.log(' Could not connect to server: ' + err.message);
-    process.exit(1);
+    return collectConfig(existingUrl);
   }
 }
 
@@ -582,6 +586,14 @@ function registerHandlers() {
   });
 }
 
+async function reAuthenticate() {
+  log('WARN', 'Token invalid or expired — re-authenticating...');
+  if (socket) { socket.disconnect(); socket = null; }
+  agentConfig = await collectConfig(agentConfig?.serverUrl);
+  saveConfig(agentConfig);
+  await connect();
+}
+
 async function connect() {
   agentConfig = loadConfig();
 
@@ -607,8 +619,16 @@ async function connect() {
     socket.emit('agent:status', { connected: true, browsersActive: browsers.size });
   });
 
-  socket.on('connect_error', (err) => {
-    log('ERROR', `Connection error: ${err.message}`);
+  socket.on('agent:auth:invalid', async () => {
+    await reAuthenticate();
+  });
+
+  socket.on('connect_error', async (err) => {
+    if (err.message && (err.message.includes('invalid') || err.message.includes('unauthorized') || err.message.includes('401'))) {
+      await reAuthenticate();
+    } else {
+      log('ERROR', `Connection error: ${err.message}`);
+    }
   });
 
   socket.on('disconnect', (reason) => {
