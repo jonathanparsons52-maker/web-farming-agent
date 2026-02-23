@@ -1,0 +1,7 @@
+node_modules/
+agent-config.json
+settings.json
+proxies.json
+karma_accounts.json
+imported_accounts.json
+*.log
