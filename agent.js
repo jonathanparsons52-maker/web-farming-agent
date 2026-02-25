@@ -5,6 +5,9 @@ const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const { SocksProxyAgent } = require('socks-proxy-agent');
+const captchaSolver = require('./captcha-solver');
+const creationService = require('./creation-service');
 
 const CONFIG_FILE = path.join(__dirname, 'agent-config.json');
 const DATA_DIR = __dirname;
@@ -102,7 +105,7 @@ async function collectConfig(existingUrl) {
   const cleanUrl = serverUrl.replace(/\/$/, '');
   console.log('\n Logging in...');
   try {
-    const res = await axios.post(`${cleanUrl}/api/auth/login`, { username, password }, { timeout: 10000 });
+    const res = await axios.post(`${cleanUrl}/api/auth/login/agent`, { username, password }, { timeout: 10000 });
     if (!res.data.success || !res.data.token) {
       console.log(' Login failed: ' + (res.data.message || 'Invalid credentials'));
       return collectConfig(existingUrl);
@@ -120,39 +123,57 @@ function getAdsPowerBaseUrl() {
   return settings.apiUrl || 'http://local.adspower.net:50325';
 }
 
-async function adsPowerRequest(endpoint, method, params, data) {
-  const baseUrl = getAdsPowerBaseUrl();
+async function adsPowerRequest(endpoint, method, params, data, retries = 3) {
   const settings = loadData('settings');
-  const apiKey = settings.apiKey || '';
+  const configuredUrl = settings.apiUrl || 'http://local.adspower.net:50325';
+  const fallbackUrls = [
+    configuredUrl,
+    'http://127.0.0.1:50325',
+    'http://localhost:50325'
+  ];
+  const uniqueUrls = [...new Set(fallbackUrls)];
 
-  try {
-    const axiosConfig = {
-      method: method || 'GET',
-      url: `${baseUrl}${endpoint}`,
-      timeout: 20000
-    };
-
-    if (method === 'GET' && params && Object.keys(params).length > 0) {
-      axiosConfig.params = params;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    if (attempt > 0) {
+      const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+      console.log(`[AdsPower] Retry ${attempt}/${retries - 1} after ${backoff}ms...`);
+      await new Promise(r => setTimeout(r, backoff));
     }
 
-    if (data && (method === 'POST' || method === 'PUT')) {
-      axiosConfig.data = data;
-      axiosConfig.headers = { 'Content-Type': 'application/json' };
+    let lastErr = null;
+    for (const baseUrl of uniqueUrls) {
+      try {
+        const axiosConfig = {
+          method: method || 'GET',
+          url: `${baseUrl}${endpoint}`,
+          timeout: 15000
+        };
+
+        if (method === 'GET' && params && Object.keys(params).length > 0) {
+          axiosConfig.params = params;
+        }
+
+        if (data && (method === 'POST' || method === 'PUT')) {
+          axiosConfig.data = data;
+          axiosConfig.headers = { 'Content-Type': 'application/json' };
+        }
+
+        const response = await axios(axiosConfig);
+        return { success: true, data: response.data };
+      } catch (err) {
+        lastErr = err;
+        if (err.response && err.response.status >= 400 && err.response.status < 500) {
+          return { success: false, error: err.response.data?.msg || err.response.statusText, status: err.response.status };
+        }
+        continue;
+      }
     }
 
-    if (apiKey) {
-      axiosConfig.headers = { ...(axiosConfig.headers || {}), 'Authorization': `Bearer ${apiKey}` };
+    if (attempt === retries - 1) {
+      return { success: false, error: lastErr?.message || 'All AdsPower connection attempts failed' };
     }
-
-    const response = await axios(axiosConfig);
-    return { success: true, data: response.data };
-  } catch (err) {
-    if (err.response) {
-      return { success: false, error: err.response.data?.msg || err.response.statusText, status: err.response.status };
-    }
-    return { success: false, error: err.message };
   }
+  return { success: false, error: 'All AdsPower connection attempts failed' };
 }
 
 async function puppeteerConnect(wsEndpoint, userId) {
@@ -395,7 +416,7 @@ function registerHandlers() {
     socket.emit('agent:result', { requestId, ...result });
   });
 
-  socket.on('agent:adspower:createProfileForDay1', async ({ requestId, username, group_id, proxy_index }) => {
+  socket.on('agent:adspower:createProfileForDay1', async ({ requestId, username, group_id, proxy_index, authUsername }) => {
     try {
       const proxies = loadData('proxies');
       const proxyIndex = proxy_index || 0;
@@ -406,7 +427,7 @@ function registerHandlers() {
       }
 
       const proxy = proxies[proxyIndex % proxies.length];
-      const profileName = `${username}-proxy${proxyIndex + 1}`;
+      const profileName = `${username}-proxy${proxyIndex + 1}${authUsername ? '-' + authUsername : ''}`;
 
       let userProxyConfig = null;
       if (proxy.host && proxy.port) {
@@ -458,20 +479,33 @@ function registerHandlers() {
       const apiData = result.data;
       let userId = null;
 
+      log('INFO', `[CreateProfile] API response: ${JSON.stringify(apiData).substring(0, 500)}`);
+
       if (apiData?.data?.user_id) userId = apiData.data.user_id;
+      else if (apiData?.data?.id) userId = apiData.data.id;
       else if (apiData?.user_id) userId = apiData.user_id;
+      else if (apiData?.id) userId = apiData.id;
 
       if (!userId) {
-        const queryResult = await adsPowerRequest('/api/v1/user/list', 'GET', { group_id, keywords: profileName });
+        log('INFO', `[CreateProfile] No user_id in response, querying by name: ${profileName}`);
+        await new Promise(r => setTimeout(r, 2000));
+        const queryResult = await adsPowerRequest('/api/v1/user/list', 'GET', { group_id, page_size: 100 });
         if (queryResult.success && queryResult.data) {
           const profileList = queryResult.data?.data?.list || queryResult.data?.list || [];
-          const foundProfile = profileList.find(p => (p.name || p.username || '') === profileName);
-          if (foundProfile?.user_id) userId = foundProfile.user_id;
+          log('INFO', `[CreateProfile] Found ${profileList.length} profiles in group`);
+          const foundProfile = profileList.find(p =>
+            (p.name || p.username || p.serial_number || '') === profileName ||
+            (p.name || '').includes(profileName)
+          );
+          if (foundProfile) {
+            userId = foundProfile.user_id || foundProfile.id;
+            log('INFO', `[CreateProfile] Found profile by name: ${userId}`);
+          }
         }
       }
 
       if (!userId) {
-        socket.emit('agent:result', { requestId, success: false, error: 'Profile created but could not extract user_id' });
+        socket.emit('agent:result', { requestId, success: false, error: `Profile created but could not extract user_id. API response: ${JSON.stringify(apiData).substring(0, 200)}` });
         return;
       }
 
@@ -565,6 +599,62 @@ function registerHandlers() {
     }
   });
 
+  socket.on('agent:reddit:fetch', async ({ requestId, url }) => {
+    const baseHeaders = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' };
+    const proxies = loadData('proxies').filter(p => p.host && p.port);
+    const shuffled = proxies.sort(() => Math.random() - 0.5);
+    const attempts = [...shuffled, null];
+    let lastErr = null;
+    for (const proxy of attempts) {
+      try {
+        const axiosConfig = { headers: baseHeaders, timeout: 15000 };
+        if (proxy) {
+          const proxyUrl = `socks5://${proxy.username || ''}${proxy.password ? ':' + proxy.password : ''}${proxy.username ? '@' : ''}${proxy.host}:${proxy.port}`;
+          const agent = new SocksProxyAgent(proxyUrl);
+          axiosConfig.httpAgent = agent;
+          axiosConfig.httpsAgent = agent;
+        }
+        const response = await axios.get(url, axiosConfig);
+        socket.emit('agent:result', { requestId, success: true, data: response.data });
+        return;
+      } catch (err) {
+        lastErr = err;
+        const status = err.response?.status;
+        if (status === 403 || status === 429) break;
+      }
+    }
+    const status = lastErr?.response?.status;
+    socket.emit('agent:result', {
+      requestId, success: false,
+      error: status === 403 ? 'Blocked by Reddit (403)' : status === 429 ? 'Rate limited by Reddit (429)' : lastErr?.message,
+      status
+    });
+  });
+
+  socket.on('agent:captcha:handle', async ({ requestId, userId }) => {
+    try {
+      const page = await getPage(userId);
+      const settings = loadData('settings');
+      const openaiKey = settings.openaiApiKey;
+      const result = await captchaSolver.solveRecaptchaWithAudio(page, openaiKey, (msg) => log('INFO', msg));
+      socket.emit('agent:result', { requestId, ...result });
+    } catch (err) {
+      socket.emit('agent:result', { requestId, success: false, error: err.message });
+    }
+  });
+
+  socket.on('agent:captcha:solveTurnstile', async ({ requestId, userId }) => {
+    try {
+      const page = await getPage(userId);
+      const settings = loadData('settings');
+      const antiCaptchaKey = settings.captchaApiKey;
+      const result = await captchaSolver.solveTurnstileOnPage(page, antiCaptchaKey, (msg) => log('INFO', msg));
+      socket.emit('agent:result', { requestId, ...result });
+    } catch (err) {
+      socket.emit('agent:result', { requestId, success: false, error: err.message });
+    }
+  });
+
   socket.on('agent:farming:start', async ({ requestId, config: farmConfig }) => {
     if (farmingActive) {
       socket.emit('agent:result', { requestId, success: false, error: 'Farming already running' });
@@ -583,6 +673,76 @@ function registerHandlers() {
     socket.emit('agent:result', { requestId, success: true });
     log('INFO', 'Farming stop requested');
     socket.emit('agent:farming:progress', { status: 'stopped' });
+  });
+
+  creationService.init({
+    adsPowerRequest,
+    captchaSolver,
+    logFn: log,
+    browsers,
+    loadData
+  });
+
+  socket.on('agent:creation:start', async ({ requestId, targetCount, password }) => {
+    const authUser = agentConfig?.username || '';
+    const result = await creationService.start(targetCount, password, authUser);
+    socket.emit('agent:result', { requestId, ...result });
+  });
+
+  socket.on('agent:creation:stop', ({ requestId }) => {
+    const result = creationService.stop();
+    socket.emit('agent:result', { requestId, ...result });
+  });
+
+  socket.on('agent:creation:progress', ({ requestId }) => {
+    socket.emit('agent:result', { requestId, success: true, data: creationService.getProgress() });
+  });
+
+  socket.on('agent:creation:setConcurrency', ({ requestId, concurrency }) => {
+    const result = creationService.setConcurrency(concurrency);
+    socket.emit('agent:result', { requestId, ...result });
+  });
+
+  socket.on('agent:creation:setVisible', ({ requestId, visible }) => {
+    const result = creationService.setVisible(visible);
+    socket.emit('agent:result', { requestId, ...result });
+  });
+
+  socket.on('agent:creation:profiles', async ({ requestId }) => {
+    try {
+      const result = await adsPowerRequest('/api/v1/user/list', 'GET', { page_size: 100 });
+      if (!result.success) {
+        socket.emit('agent:result', { requestId, success: false, error: result.error });
+        return;
+      }
+      const allProfiles = result.data?.data?.list || result.data?.list || [];
+      const wcProfiles = allProfiles.filter(p => {
+        const name = p.name || '';
+        return name.startsWith('WC_') || name.includes('-proxy');
+      });
+      socket.emit('agent:result', { requestId, success: true, data: { profiles: wcProfiles, count: wcProfiles.length } });
+    } catch (err) {
+      socket.emit('agent:result', { requestId, success: false, error: err.message });
+    }
+  });
+
+  socket.on('agent:creation:deleteAll', async ({ requestId }) => {
+    try {
+      const result = await adsPowerRequest('/api/v1/user/list', 'GET', { page_size: 100 });
+      const allProfiles = result.data?.data?.list || result.data?.list || [];
+      const wcIds = allProfiles.filter(p => {
+        const name = p.name || '';
+        return name.startsWith('WC_') || name.includes('-proxy');
+      }).map(p => p.user_id || p.id);
+      if (wcIds.length === 0) {
+        socket.emit('agent:result', { requestId, success: true, data: { deleted: 0 } });
+        return;
+      }
+      await adsPowerRequest('/api/v1/user/delete', 'POST', null, { user_ids: wcIds });
+      socket.emit('agent:result', { requestId, success: true, data: { deleted: wcIds.length } });
+    } catch (err) {
+      socket.emit('agent:result', { requestId, success: false, error: err.message });
+    }
   });
 }
 
@@ -606,7 +766,7 @@ async function connect() {
   log('INFO', `Connecting to ${agentConfig.serverUrl}...`);
 
   socket = io(agentConfig.serverUrl, {
-    auth: { token: agentConfig.token },
+    auth: { token: agentConfig.token, type: 'agent' },
     reconnection: true,
     reconnectionDelay: 3000,
     reconnectionAttempts: Infinity,
